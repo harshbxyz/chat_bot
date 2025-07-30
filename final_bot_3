@@ -1,0 +1,128 @@
+import streamlit as st
+import PyPDF2
+from sentence_transformers import SentenceTransformer, util
+import requests
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "llama3.2-vision"
+
+# --- Custom Dashboard Header ---
+st.markdown(
+    """
+    <div style="text-align:center;">
+        <h1 style="color:#FF5733;font-family:Arial,Helvetica,sans-serif;">
+            Hustler's Bot for Cars: Ready to Roll!
+        </h1>
+        <img src="https://images.unsplash.com/photo-1503736334956-4c8f8e92946d?auto=format&fit=crop&w=800&q=80"
+             alt="Sports Cars" width="400" style="border-radius:15px;box-shadow:2px 2px 10px #aaa;">
+        <br><br>
+        <img src="https://cdn.pixabay.com/photo/2017/01/31/13/14/chat-2020108_1280.png"
+             alt="AI Bot Chat" width="220" style="margin:10px;">
+        <p style="font-size:20px;color:#0074D9;">
+            Your AI co-pilot is fueled up and ready to answer your burning car questions.<br>
+            <b>Buckle up and go ahead!</b>
+        </p>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+
+st.markdown("### Upload your PDF below:")
+
+pdf_file = st.file_uploader("Upload a PDF", type=["pdf"])
+
+temperature = st.slider(
+    "Model temperature (lower = more exact, higher = more creative)", 
+    min_value=0.0, max_value=1.0, value=0.1, step=0.05
+)
+
+if "chat_history" not in st.session_state:
+    st.session_state["chat_history"] = []
+if "awaiting_question" not in st.session_state:
+    st.session_state["awaiting_question"] = True
+
+if pdf_file:
+    # Extract text from PDF
+    pdf_reader = PyPDF2.PdfReader(pdf_file)
+    text = ""
+    for page in pdf_reader.pages:
+        text += page.extract_text() or ""
+
+    # Split text into larger chunks for speed
+    chunk_size = 1500
+    chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+
+    # Cache embeddings to avoid recomputation
+    if "embeddings" not in st.session_state or st.session_state.get("last_pdf") != pdf_file.name:
+        embedder = SentenceTransformer("all-MiniLM-L6-v2")
+        chunk_embeddings = embedder.encode(chunks, convert_to_tensor=True)
+        st.session_state["embeddings"] = chunk_embeddings
+        st.session_state["chunks"] = chunks
+        st.session_state["embedder"] = embedder
+        st.session_state["last_pdf"] = pdf_file.name
+    else:
+        chunk_embeddings = st.session_state["embeddings"]
+        chunks = st.session_state["chunks"]
+        embedder = st.session_state["embedder"]
+
+    st.success("PDF processed! Ask your questions below.")
+
+    # Display chat history
+    st.markdown("<h3 style='color:#0074D9;'>Conversation History</h3>", unsafe_allow_html=True)
+    for entry in st.session_state["chat_history"]:
+        st.markdown(f"<div style='background:#222;color:#F8F8F8;border-radius:10px;padding:10px;margin-bottom:8px;'>"
+                    f"<b>🧑 You:</b> {entry['question']}<br>"
+                    f"<b>🤖 Bot:</b> {entry['answer']}</div>", unsafe_allow_html=True)
+
+    # Conversation flow control
+    if st.session_state["awaiting_question"]:
+        st.markdown("<div style='text-align:center;'><span style='font-size:22px;color:#0074D9;'>🗨️ Ask a question about your PDF:</span></div>", unsafe_allow_html=True)
+        user_question = st.text_input("Type your question and press Enter or click 'Ask'", key="user_question")
+        ask_button = st.button("Ask")
+        if ask_button and user_question:
+            with st.spinner("Thinking..."):
+                question_embedding = embedder.encode(user_question, convert_to_tensor=True)
+                scores = util.pytorch_cos_sim(question_embedding, chunk_embeddings)[0]
+                top_k = 1
+                top_indices = scores.topk(top_k).indices.tolist()
+                context = "\n\n".join([chunks[i] for i in top_indices])
+
+                prompt = (
+                    "You are a helpful assistant. Use the following document context to answer the user's question. "
+                    "If the context does not contain the answer, say 'I could not find the answer in the provided document.'\n\n"
+                    f"Context:\n{context}\n\n"
+                    f"Question: {user_question}\nAnswer:"
+                )
+
+                try:
+                    response = requests.post(
+                        OLLAMA_URL,
+                        json={
+                            "model": OLLAMA_MODEL,
+                            "prompt": prompt,
+                            "stream": False,
+                            "temperature": temperature
+                        },
+                        timeout=120
+                    )
+                    if response.ok and "response" in response.json():
+                        answer = response.json()["response"].strip()
+                        if not answer:
+                            st.warning("No answer was generated. Try rephrasing your question or check your document.")
+                        else:
+                            st.session_state["chat_history"].append({"question": user_question, "answer": answer})
+                            st.session_state["awaiting_question"] = False
+                            st.experimental_rerun()
+                    else:
+                        st.error("Error communicating with Ollama or no answer returned.")
+                except Exception as e:
+                    st.error(f"Error communicating with Ollama: {e}")
+    else:
+        # Show last answer and button to ask another question
+        st.markdown("<div style='text-align:center;'><span style='font-size:22px;color:#0074D9;'>✅ Answer provided. Click below to ask another question.</span></div>", unsafe_allow_html=True)
+        next_button = st.button("Ask another question 💬")
+        if next_button:
+            st.session_state["awaiting_question"] = True
+            st.experimental_rerun()
+else:
+    st.info("Please upload a PDF to start asking questions.")
