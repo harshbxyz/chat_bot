@@ -1,0 +1,114 @@
+import streamlit as st
+import PyPDF2
+import pandas as pd
+from sentence_transformers import SentenceTransformer, util
+import requests
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "llama3.2-vision"
+
+# --- Custom Dashboard Header ---
+st.markdown(
+    """
+    <div style="text-align:center;">
+        <h1 style="color:#FF5733;font-family:Arial,Helvetica,sans-serif;">
+            Hustler's Bot for Cars: Ready to Roll!
+        </h1>
+        <img src="https://images.unsplash.com/photo-1503736334956-4c8f8e92946d?auto=format&fit=crop&w=800&q=80"
+             alt="Sports Cars" width="400" style="border-radius:15px;box-shadow:2px 2px 10px #aaa;">
+        <br><br>
+        <img src="https://cdn.pixabay.com/photo/2017/01/31/13/14/chat-2020108_1280.png"
+             alt="AI Bot Chat" width="220" style="margin:10px;">
+        <p style="font-size:20px;color:#0074D9;">
+            Your AI co-pilot is fueled up and ready to answer your burning car questions.<br>
+            <b>Buckle up and go ahead!</b>
+        </p>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+
+st.markdown("### Upload one or more PDF/Excel files below:")
+
+uploaded_files = st.file_uploader(
+    "Upload PDF or Excel files", type=["pdf", "xlsx"], accept_multiple_files=True
+)
+
+add_more = st.checkbox("Add more files? (Check to enable multiple uploads)")
+
+@st.cache_resource(show_spinner=False)
+def get_embedder():
+    return SentenceTransformer("all-MiniLM-L6-v2")
+
+@st.cache_data(show_spinner=True)
+def process_files(files):
+    text = ""
+    for file in files:
+        if file.name.lower().endswith(".pdf"):
+            pdf_reader = PyPDF2.PdfReader(file)
+            for page in pdf_reader.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text
+        elif file.name.lower().endswith(".xlsx"):
+            df = pd.read_excel(file, sheet_name=None)
+            for sheet_name, sheet_df in df.items():
+                text += f"\nSheet: {sheet_name}\n"
+                text += sheet_df.astype(str).apply(lambda x: ' '.join(x), axis=1).str.cat(sep='\n')
+    chunk_size = 1000
+    chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+    return chunks
+
+# Initialize chat history in session state
+if "chat_history" not in st.session_state:
+    st.session_state["chat_history"] = []
+
+if uploaded_files and (add_more or len(uploaded_files) == 1):
+    with st.spinner("Processing files and preparing for Q&A..."):
+        chunks = process_files(uploaded_files)
+        embedder = get_embedder()
+        chunk_embeddings = embedder.encode(chunks, convert_to_tensor=True)
+        st.session_state["chunks"] = chunks
+        st.session_state["embeddings"] = chunk_embeddings
+        st.session_state["embedder"] = embedder
+
+    st.success("Files processed! Ask your questions below.")
+
+    # Display chat history
+    st.markdown("<h3 style='color:#0074D9;'>Conversation History</h3>", unsafe_allow_html=True)
+    for entry in st.session_state["chat_history"]:
+        st.markdown(f"<div style='background:#F0F8FF;border-radius:10px;padding:10px;margin-bottom:8px;'>"
+                    f"<b>🧑 You:</b> {entry['question']}<br>"
+                    f"<b>🤖 Bot:</b> {entry['answer']}</div>", unsafe_allow_html=True)
+
+    # Input for new question
+    st.markdown("<div style='text-align:center;'><span style='font-size:22px;color:#0074D9;'>🗨️ Ask a question about your documents:</span></div>", unsafe_allow_html=True)
+    user_question = st.text_input("", key="user_question")
+    ask_button = st.button("Ask")
+
+    if ask_button and user_question:
+        with st.spinner("Thinking..."):
+            question_embedding = embedder.encode(user_question, convert_to_tensor=True)
+            scores = util.pytorch_cos_sim(question_embedding, chunk_embeddings)[0]
+            top_k = 1
+            top_indices = scores.topk(top_k).indices.tolist()
+            context = "\n\n".join([chunks[i] for i in top_indices])
+
+            prompt = (
+                "You are a helpful assistant. Use the following document context to answer the user's question.\n\n"
+                f"Context:\n{context}\n\n"
+                f"Question: {user_question}\nAnswer:"
+            )
+
+            response = requests.post(
+                OLLAMA_URL,
+                json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}
+            )
+            if response.ok:
+                answer = response.json()["response"].strip()
+                st.session_state["chat_history"].append({"question": user_question, "answer": answer})
+                st.experimental_rerun()
+            else:
+                st.error("Error communicating with Ollama.")
+else:
+    st.info("Please upload one or more PDF/Excel files to get started.")
